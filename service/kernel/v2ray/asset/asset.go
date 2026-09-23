@@ -11,6 +11,8 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/adrg/xdg"
@@ -177,6 +179,151 @@ func findAssetOutsideDir(name string, assetDir string) string {
 		}
 	}
 	return ""
+}
+
+// xdgAssetDirs returns the data directories the XDG data file search visits,
+// in the order it visits them: the user's data home first, then every entry of
+// XDG_DATA_DIRS.
+func xdgAssetDirs() []string {
+	return append([]string{xdg.DataHome}, xdg.DataDirs...)
+}
+
+// IsRuntimeAssetDir reports whether dir is the runtime directory v2rayA points
+// the core at when no asset directory is configured. Only that directory is
+// filled from every data directory: one named explicitly (--v2ray-assetsdir)
+// is left holding exactly what its owner put there.
+func IsRuntimeAssetDir(dir string) bool {
+	if runtime.GOOS == "windows" || dir == "" {
+		return false
+	}
+	return filepath.Clean(dir) == filepath.Clean(runtimeAssetDir())
+}
+
+// xdgAsset is one rule data file name found under v2raya/ in the data
+// directories, together with the copy the search order gives precedence to.
+type xdgAsset struct {
+	name    string   // file name, linked as it is spelled
+	path    string   // the copy that wins
+	ignored []string // copies in directories visited later
+}
+
+// LinkXDGAssets links every dat file the data directories hold under v2raya/
+// into assetDir, the one directory the core is told to search.
+//
+// A distribution that installs geoip.dat into /usr/share/v2raya, or an
+// administrator who drops custom.dat into ~/.local/share/v2raya, then needs no
+// second copy in the runtime directory, which is cleared between sessions and
+// could not be written by a service user at all.
+//
+// A name that is in more than one data directory is resolved the way the data
+// file search resolves it: the directory visited first wins, and the copies
+// that lose are left alone and reported as warnings, one per name, with the
+// path of each one. Nothing is done on Windows, where the configured directory
+// holds the files themselves rather than links to them.
+func LinkXDGAssets(assetDir string) []string {
+	if runtime.GOOS == "windows" || assetDir == "" {
+		return nil
+	}
+	assets := discoverXDGAssets()
+	linkAssets(assets, assetDir)
+	return duplicateWarnings(assets)
+}
+
+// duplicateWarnings describes every name found in more than one data
+// directory, so that a copy the search order hides is not dropped without a
+// word. Directories are visited home first, so the losing copies are the ones
+// listed after the winner.
+func duplicateWarnings(assets []xdgAsset) []string {
+	var warnings []string
+	for _, a := range assets {
+		if len(a.ignored) == 0 {
+			continue
+		}
+		warnings = append(warnings, fmt.Sprintf(
+			"rule data %v is in more than one directory: using %v and ignoring %v",
+			a.name, a.path, strings.Join(a.ignored, ", ")))
+	}
+	return warnings
+}
+
+// linkAssets links each winning copy into assetDir, replacing a link that
+// points somewhere else and leaving an identical one alone. Failing to link a
+// single file is logged and does not stop the others.
+func linkAssets(assets []xdgAsset, assetDir string) {
+	if len(assets) == 0 {
+		return
+	}
+	if err := os.MkdirAll(assetDir, 0755); err != nil {
+		log.Warn("cannot create the asset directory %v: %v", assetDir, err)
+		return
+	}
+	for _, a := range assets {
+		target := filepath.Join(assetDir, a.name)
+		if link, err := os.Readlink(target); err == nil && link == a.path {
+			// The link already points at the copy that wins.
+			continue
+		}
+		_ = os.Remove(target)
+		if err := os.Symlink(a.path, target); err != nil {
+			log.Warn("cannot link %v into %v: %v", a.path, assetDir, err)
+			continue
+		}
+		log.Info("linked %v into the core asset directory %v", a.path, assetDir)
+	}
+}
+
+// discoverXDGAssets walks the data directories in search order and returns one
+// entry per dat file name: the copy that wins and the ones it shadows.
+func discoverXDGAssets() []xdgAsset {
+	index := make(map[string]int)
+	var assets []xdgAsset
+	for _, dir := range xdgAssetDirs() {
+		sub := filepath.Join(dir, "v2raya")
+		for _, name := range datFilesIn(sub) {
+			path := filepath.Join(sub, name)
+			key := assetKey(name)
+			if i, ok := index[key]; ok {
+				assets[i].ignored = append(assets[i].ignored, path)
+				continue
+			}
+			index[key] = len(assets)
+			assets = append(assets, xdgAsset{name: name, path: path})
+		}
+	}
+	return assets
+}
+
+// datFilesIn returns the regular dat files directly inside dir, sorted so that
+// the result does not depend on the filesystem. A missing directory is normal:
+// not every data directory has a v2raya subdirectory.
+func datFilesIn(dir string) []string {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var names []string
+	for _, e := range entries {
+		if !strings.EqualFold(filepath.Ext(e.Name()), ".dat") {
+			continue
+		}
+		info, err := os.Stat(filepath.Join(dir, e.Name()))
+		if err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		names = append(names, e.Name())
+	}
+	sort.Strings(names)
+	return names
+}
+
+// assetKey is the name two copies are compared by. On macOS the data
+// directories sit on a case-insensitive filesystem, where differently cased
+// names are one file and the second link would shadow the first.
+func assetKey(name string) string {
+	if runtime.GOOS == "darwin" {
+		return strings.ToLower(name)
+	}
+	return name
 }
 
 func DoesV2rayAssetExist(filename string) bool {

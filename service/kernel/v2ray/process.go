@@ -258,7 +258,15 @@ func StartCoreProcess(ctx context.Context) (*os.Process, error) {
 	// Get asset directory
 	assetDir := asset.GetV2rayLocationAssetOverride()
 	// The core is told to look in assetDir and nowhere else, so put the dat
-	// files there first when they live in a system directory.
+	// files there first when they live in a system directory. The runtime
+	// directory is filled from every XDG data directory, so a dat file
+	// installed in /usr/share/v2raya or dropped into ~/.local/share/v2raya is
+	// visible to the core without being copied by hand.
+	if asset.IsRuntimeAssetDir(assetDir) {
+		for _, warning := range asset.LinkXDGAssets(assetDir) {
+			log.Warn("%v", warning)
+		}
+	}
 	asset.EnsureCoreAssets(assetDir)
 	log.Info("Asset directory for %s: %v", "v2raya_core", assetDir)
 
